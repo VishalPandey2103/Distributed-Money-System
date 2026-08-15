@@ -1,0 +1,25 @@
+{
+  "name": "ledger",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "dev": "node --watch src/server.js | pino-pretty",
+    "start": "node src/server.js",
+    "migrate": "node scripts/migrate.js",
+    "test": "node --test --test-concurrency=1 tests/"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ioredis": "^5.4.1",
+    "pg": "^8.11.5",
+    "pino": "^9.2.0",
+    "pino-http": "^10.1.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "pino-pretty": "^11.2.1"
+  }
+}
