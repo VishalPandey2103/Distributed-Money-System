@@ -4,8 +4,9 @@ import pino from 'pino';
 
 const log = pino({ name: 'db', level: process.env.LOG_LEVEL || 'info' });
 
-// Parse NUMERIC into a JS number so balances come back as numbers.
-pg.types.setTypeParser(1700, (v) => (v === null ? null : Number(v)));
+// pg returns NUMERIC (OID 1700) as string by default. Keep it that way —
+// we convert to BigInt at the service boundary. NUMERIC(20,0) overflows
+// JS Number at 2^53 (~9 quadrillion paise), so never parse as Number.
 
 export const pool = new pg.Pool({
     connectionString: process.env.DATABASE_URL,
