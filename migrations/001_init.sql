@@ -26,3 +26,10 @@ CREATE TABLE IF NOT EXISTS idempotency (
     body        JSONB       NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Append-only enforcement via RULES.
+CREATE OR REPLACE RULE ledger_no_update AS
+    ON UPDATE TO ledger DO INSTEAD NOTHING;
+
+CREATE OR REPLACE RULE ledger_no_delete AS
+    ON DELETE TO ledger DO INSTEAD NOTHING;
