@@ -5,7 +5,19 @@ const MAX_PAISE = 10n ** 20n - 1n; // matches NUMERIC(20,0)
 
 export function parsePaise(input) {
     if (typeof input === 'bigint') return validate(input);
-    return validate(BigInt(input));
+    if (typeof input === 'number') {
+        if (!Number.isSafeInteger(input)) {
+            throw new RangeError(`amount ${input} exceeds safe integer range`);
+        }
+        return validate(BigInt(input));
+    }
+    if (typeof input === 'string') {
+        if (!/^-?\d+$/.test(input)) {
+            throw new TypeError(`amount "${input}" is not an integer paise string`);
+        }
+        return validate(BigInt(input));
+    }
+    throw new TypeError(`amount has unsupported type ${typeof input}`);
 }
 
 function validate(v) {
