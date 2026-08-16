@@ -2,6 +2,8 @@ import crypto from 'node:crypto';
 
 export const GENESIS_HASH = '0'.repeat(64);
 
+// Domain-separated hash of a ledger entry. Field order is a schema —
+// changing it invalidates every existing chain.
 export function hashEntry({ prevHash, txnId, fromAccount, toAccount, amount }) {
     if (prevHash.length !== 64) {
         throw new Error(`prevHash must be 64 hex chars, got ${prevHash.length}`);
