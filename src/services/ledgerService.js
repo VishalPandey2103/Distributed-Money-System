@@ -7,6 +7,9 @@ import * as idemModel from '../models/idempotencyModel.js';
 
 const IDEM_TTL = Number(process.env.IDEMPOTENCY_TTL_SECONDS || 86400);
 
+// Single constant advisory-lock key for chain-tip serialization.
+const CHAIN_LOCK_KEY = 91823741823;
+
 export class AppError extends Error {
     constructor(code, statusCode, message, details) {
         super(message);
@@ -102,8 +105,8 @@ export async function transfer({ txnId, fromAccount, toAccount, amountPaise }) {
             );
         }
 
-        // Chain-tip serialization: table lock so two txns cannot read the same tip.
-        await client.query(`LOCK TABLE ledger IN SHARE ROW EXCLUSIVE MODE`);
+        // Chain-tip serialization.
+        await client.query(`SELECT pg_advisory_xact_lock($1)`, [CHAIN_LOCK_KEY]);
 
         const tip = await ledgerModel.getChainTip(client);
         const prevHash = tip ? tip.entry_hash : GENESIS_HASH;
