@@ -145,12 +145,6 @@ export async function transfer({ txnId, fromAccount, toAccount, amountPaise }) {
             responseBody,
         });
 
-        // Cache the response so duplicate txns hit Redis instead of Postgres.
-        await safeRedisSet(
-            `idem:${txnId}`,
-            JSON.stringify({ status: 200, body: responseBody })
-        );
-
         return {
             cached: false,
             source: 'fresh',
@@ -158,6 +152,14 @@ export async function transfer({ txnId, fromAccount, toAccount, amountPaise }) {
             body: responseBody,
         };
     });
+
+    // Post-commit Redis write. Only cache what Postgres durably committed.
+    if (!result.cached || result.source === 'postgres') {
+        await safeRedisSet(
+            `idem:${txnId}`,
+            JSON.stringify({ status: result.status, body: result.body })
+        );
+    }
 
     return result;
 }
