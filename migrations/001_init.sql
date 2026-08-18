@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS ledger (
     created_at     TIMESTAMPTZ    NOT NULL DEFAULT NOW()
 );
 
+CREATE INDEX IF NOT EXISTS ix_ledger_from ON ledger (from_account);
+CREATE INDEX IF NOT EXISTS ix_ledger_to   ON ledger (to_account);
+
 CREATE TABLE IF NOT EXISTS idempotency (
     txn_id      TEXT        PRIMARY KEY,
     status      INTEGER     NOT NULL,
