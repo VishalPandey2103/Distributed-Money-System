@@ -11,11 +11,12 @@ import { hashEntry, GENESIS_HASH } from '../src/services/hashService.js';
 const RUN = randomUUID().slice(0, 8);
 const A = `A_${RUN}`;
 const B = `B_${RUN}`;
+const C = `C_${RUN}`;
 
 before(async () => {
     // Clean any prior test rows for this run prefix (defensive).
     await pool.query(`DELETE FROM idempotency WHERE txn_id LIKE $1`, [`${RUN}%`]);
-    await pool.query(`DELETE FROM accounts WHERE id IN ($1,$2)`, [A, B]);
+    await pool.query(`DELETE FROM accounts WHERE id IN ($1,$2,$3)`, [A, B, C]);
 });
 
 after(async () => {
@@ -97,4 +98,28 @@ test('same-account transfer rejected', async () => {
 test('verifyLedger returns ok for untampered chain', async () => {
     const v = await ledgerService.verifyLedger();
     assert.equal(v.ok, true);
+});
+
+test('concurrent transfers do not deadlock and conserve money', async () => {
+    await ledgerService.createAccount({ accountId: C, openingBalancePaise: 1000_00n });
+
+    // 20 concurrent transfers A→C and C→A. Different txnIds, deterministic
+    // account lock order prevents deadlock.
+    const before = (await ledgerService.getAccount(A)).balancePaise +
+                   (await ledgerService.getAccount(C)).balancePaise;
+
+    const jobs = [];
+    for (let i = 0; i < 10; i++) {
+        jobs.push(ledgerService.transfer({
+            txnId: `${RUN}_p1_${i}`, fromAccount: A, toAccount: C, amountPaise: 1n,
+        }));
+        jobs.push(ledgerService.transfer({
+            txnId: `${RUN}_p2_${i}`, fromAccount: C, toAccount: A, amountPaise: 1n,
+        }));
+    }
+    await Promise.all(jobs);
+
+    const after = (await ledgerService.getAccount(A)).balancePaise +
+                  (await ledgerService.getAccount(C)).balancePaise;
+    assert.equal(before, after, 'total money must be conserved');
 });
