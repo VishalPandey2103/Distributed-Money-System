@@ -20,14 +20,16 @@ export async function findAccountById(db, accountId) {
     return res.rows[0] || null;
 }
 
-// FOR UPDATE row locks so concurrent transfers serialise on the same account.
+// Sorted, deterministic FOR UPDATE prevents deadlock under concurrent transfers.
 export async function lockAccountsForUpdate(db, accountIds) {
+    const sorted = [...new Set(accountIds)].sort();
     const res = await db.query(
         `SELECT id, balance, version
          FROM accounts
          WHERE id = ANY($1::text[])
+         ORDER BY id
          FOR UPDATE`,
-        [accountIds]
+        [sorted]
     );
     return res.rows;
 }
