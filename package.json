@@ -1,6 +1,6 @@
 {
   "name": "ledger",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "engines": { "node": ">=20" },
@@ -11,6 +11,8 @@
     "test": "node --test --test-concurrency=1 tests/"
   },
   "dependencies": {
+    "@grpc/grpc-js": "^1.10.9",
+    "@grpc/proto-loader": "^0.7.13",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "ioredis": "^5.4.1",
