@@ -1,14 +1,12 @@
-import { pool, withTx } from '../config/db.js';
+import { pool } from '../config/db.js';
 import { redis } from '../config/redis.js';
-import { hashEntry, GENESIS_HASH, verifyChain } from './hashService.js';
 import * as accountModel from '../models/accountModel.js';
 import * as ledgerModel from '../models/ledgerModel.js';
 import * as idemModel from '../models/idempotencyModel.js';
+import { verifyChain } from './hashService.js';
+import { getRaftNode } from '../raft/raftNode.js';
 
 const IDEM_TTL = Number(process.env.IDEMPOTENCY_TTL_SECONDS || 86400);
-
-// Single constant advisory-lock key for chain-tip serialization.
-const CHAIN_LOCK_KEY = 91823741823;
 
 export class AppError extends Error {
     constructor(code, statusCode, message, details) {
@@ -19,12 +17,27 @@ export class AppError extends Error {
     }
 }
 
+export class NotLeaderError extends Error {
+    constructor(leaderId, leaderHttp) {
+        super('NOT_LEADER');
+        this.code = 'NOT_LEADER';
+        this.statusCode = 421; // Misdirected Request — client should retry against leaderHttp
+        this.leaderId = leaderId;
+        this.leaderHttp = leaderHttp;
+    }
+}
+
 // ---------------- Accounts ----------------
+// Account creation is NOT routed through Raft in v2. Reason: it's
+// idempotent by primary key and doesn't need cross-node ordering.
+// The tradeoff is that accounts must be created explicitly on every
+// node before transfers can reference them across the cluster.
+// A production system would fold account creation into the Raft log
+// too — trivial extension, punted here to keep v2 focused.
 
 export async function createAccount({ accountId, openingBalancePaise }) {
     const row = await accountModel.insertAccount(pool, {
-        accountId,
-        balance: openingBalancePaise,
+        accountId, balance: openingBalancePaise,
     });
     if (!row) {
         throw new AppError('ACCOUNT_EXISTS', 409, `account "${accountId}" already exists`);
@@ -48,123 +61,75 @@ export async function getAccount(accountId) {
     };
 }
 
-// ---------------- Transfer ----------------
+// ---------------- Transfer via Raft ----------------
 
 export async function transfer({ txnId, fromAccount, toAccount, amountPaise }) {
     if (fromAccount === toAccount) {
         throw new AppError('SAME_ACCOUNT', 400, 'from and to must differ');
     }
 
-    // Fast path: Redis idempotency cache.
+    // Redis fast path — safe because the state machine is the
+    // ground truth for idempotency and only serves committed
+    // responses. If Redis says "we already did this", the response
+    // came from a state-machine apply that was already committed.
     const cachedRaw = await safeRedisGet(`idem:${txnId}`);
     if (cachedRaw) {
         const cached = JSON.parse(cachedRaw);
         return { cached: true, source: 'redis', ...cached };
     }
 
-    const result = await withTx(async (client) => {
-        // Serialize concurrent duplicate txnIds. Xact-scoped lock releases on COMMIT/ROLLBACK.
-        await client.query(
-            `SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`,
-            [txnId]
-        );
+    const node = getRaftNode();
+    if (!node) throw new AppError('NOT_READY', 503, 'raft node not initialized');
 
-        // Ground-truth idempotency check inside the lock.
-        const idemRow = await idemModel.findIdempotencyKey(client, txnId);
-        if (idemRow) {
-            return {
-                cached: true,
-                source: 'postgres',
-                status: idemRow.status,
-                body: idemRow.body,
-            };
-        }
-
-        // Deterministic-order account locking.
-        const accountRows = await accountModel.lockAccountsForUpdate(
-            client,
-            [fromAccount, toAccount]
-        );
-        const byId = new Map(accountRows.map((r) => [r.id, r]));
-        const from = byId.get(fromAccount);
-        const to = byId.get(toAccount);
-        if (!from) {
-            throw new AppError('FROM_NOT_FOUND', 404, `from account "${fromAccount}" not found`);
-        }
-        if (!to) {
-            throw new AppError('TO_NOT_FOUND', 404, `to account "${toAccount}" not found`);
-        }
-
-        const fromBal = BigInt(from.balance);
-        if (fromBal < amountPaise) {
-            throw new AppError(
-                'INSUFFICIENT_BALANCE',
-                400,
-                `balance ${fromBal} < amount ${amountPaise}`,
-                { balancePaise: fromBal.toString(), amountPaise: amountPaise.toString() }
-            );
-        }
-
-        // Chain-tip serialization.
-        await client.query(`SELECT pg_advisory_xact_lock($1)`, [CHAIN_LOCK_KEY]);
-
-        const tip = await ledgerModel.getChainTip(client);
-        const prevHash = tip ? tip.entry_hash : GENESIS_HASH;
-
-        const entryHash = hashEntry({
-            prevHash,
-            txnId,
-            fromAccount,
-            toAccount,
-            amount: amountPaise,
-        });
-
-        const inserted = await ledgerModel.insertLogEntry(client, {
-            txnId,
-            fromAccount,
-            toAccount,
-            amount: amountPaise,
-            prevHash,
-            entryHash,
-        });
-
-        await accountModel.debitAccount(client, fromAccount, amountPaise);
-        await accountModel.creditAccount(client, toAccount, amountPaise);
-
-        const responseBody = {
-            txnId,
-            logId: inserted.id.toString(),
-            fromAccount,
-            toAccount,
-            amountPaise: amountPaise.toString(),
-            prevHash,
-            entryHash,
-            createdAt: inserted.created_at,
-        };
-
-        await idemModel.insertIdempotencyKey(client, {
-            txnId,
-            statusCode: 200,
-            responseBody,
-        });
-
-        return {
-            cached: false,
-            source: 'fresh',
-            status: 200,
-            body: responseBody,
-        };
-    });
-
-    // Post-commit Redis write. Only cache what Postgres durably committed.
-    if (!result.cached || result.source === 'postgres') {
-        await safeRedisSet(
-            `idem:${txnId}`,
-            JSON.stringify({ status: result.status, body: result.body })
-        );
+    // If we already applied this on THIS node (state machine wrote
+    // idempotency), return that. This handles the case where
+    // Redis is cold but Postgres has the record.
+    const pgIdem = await idemModel.findIdempotencyKey(pool, txnId);
+    if (pgIdem) {
+        const response = { status: pgIdem.status, body: pgIdem.body };
+        await safeRedisSet(`idem:${txnId}`, JSON.stringify(response));
+        return { cached: true, source: 'postgres', ...response };
     }
 
-    return result;
+    // Propose through Raft. Throws NOT_LEADER if we're not the leader.
+    let proposalResult;
+    try {
+        proposalResult = await node.propose({
+            type: 'transfer',
+            txnId, fromAccount, toAccount,
+            amountPaise: amountPaise.toString(),
+        });
+    } catch (err) {
+        if (err.code === 'NOT_LEADER') {
+            throw new NotLeaderError(err.leaderId, err.leaderHttp);
+        }
+        throw err;
+    }
+
+    const applied = proposalResult.applied;
+
+    // Apply result shape: { ok, status?, body, cached?, unknown? }
+    if (!applied.ok) {
+        // Domain rejection — surface as AppError so the middleware
+        // returns the right status code.
+        const body = applied.body;
+        const err = new AppError(
+            body.error?.code || 'APPLY_FAILED',
+            applied.status || 400,
+            body.error?.message || 'apply failed',
+            body.error?.details
+        );
+        throw err;
+    }
+
+    const response = { status: applied.status || 200, body: applied.body };
+    await safeRedisSet(`idem:${txnId}`, JSON.stringify(response));
+
+    return {
+        cached: !!applied.cached,
+        source: applied.cached ? 'postgres' : 'fresh',
+        ...response,
+    };
 }
 
 // ---------------- Verify chain ----------------
@@ -176,16 +141,8 @@ export async function verifyLedger() {
 
 // ---------------- Redis helpers ----------------
 async function safeRedisGet(key) {
-    try {
-        return await redis.get(key);
-    } catch {
-        return null;
-    }
+    try { return await redis.get(key); } catch { return null; }
 }
 async function safeRedisSet(key, value) {
-    try {
-        await redis.set(key, value, 'EX', IDEM_TTL);
-    } catch {
-        /* Postgres is source of truth; Redis failure is non-fatal */
-    }
+    try { await redis.set(key, value, 'EX', IDEM_TTL); } catch { /* non-fatal */ }
 }
