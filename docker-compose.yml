@@ -1,40 +1,94 @@
-services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: ledger-postgres
-    environment:
-      POSTGRES_USER: ledger
-      POSTGRES_PASSWORD: ledger
-      POSTGRES_DB: ledger
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
-      interval: 2s
-      timeout: 3s
-      retries: 20
-    command:
-      - "postgres"
-      - "-c"
-      - "max_connections=200"
-      - "-c"
-      - "shared_buffers=256MB"
-      - "-c"
-      - "synchronous_commit=on"
+# 3 nodes, each with own Postgres + Redis. Isolation is deliberate —
+# a single shared DB would trivially violate the "replicated state
+# machine" invariant. Every node applies committed Raft entries to
+# its own DB, and correctness is checked by comparing balances across
+# nodes after commit.
 
-  redis:
-    image: redis:7-alpine
-    container_name: ledger-redis
-    ports:
-      - "6379:6379"
-    command: ["redis-server", "--appendonly", "yes"]
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 2s
-      timeout: 3s
-      retries: 20
+x-pg-defaults: &pg-defaults
+  image: postgres:16-alpine
+  environment:
+    POSTGRES_USER: ledger
+    POSTGRES_PASSWORD: ledger
+    POSTGRES_DB: ledger
+  command:
+    - "postgres"
+    - "-c"
+    - "max_connections=200"
+    - "-c"
+    - "synchronous_commit=on"
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+    interval: 2s
+    timeout: 3s
+    retries: 20
+
+x-redis-defaults: &redis-defaults
+  image: redis:7-alpine
+  command: ["redis-server", "--appendonly", "yes"]
+  healthcheck:
+    test: ["CMD", "redis-cli", "ping"]
+    interval: 2s
+    timeout: 3s
+    retries: 20
+
+services:
+  pg1: { <<: *pg-defaults, container_name: ledger-pg1, ports: ["5433:5432"], volumes: ["pg1data:/var/lib/postgresql/data"] }
+  pg2: { <<: *pg-defaults, container_name: ledger-pg2, ports: ["5434:5432"], volumes: ["pg2data:/var/lib/postgresql/data"] }
+  pg3: { <<: *pg-defaults, container_name: ledger-pg3, ports: ["5435:5432"], volumes: ["pg3data:/var/lib/postgresql/data"] }
+
+  redis1: { <<: *redis-defaults, container_name: ledger-redis1, ports: ["6390:6379"] }
+  redis2: { <<: *redis-defaults, container_name: ledger-redis2, ports: ["6391:6379"] }
+  redis3: { <<: *redis-defaults, container_name: ledger-redis3, ports: ["6392:6379"] }
+
+  node1:
+    build: .
+    container_name: ledger-node1
+    depends_on:
+      pg1:    { condition: service_healthy }
+      redis1: { condition: service_healthy }
+    environment:
+      NODE_ID: node-1
+      HTTP_PORT: 3001
+      GRPC_PORT: 6001
+      DATABASE_URL: postgres://ledger:ledger@pg1:5432/ledger
+      REDIS_URL: redis://redis1:6379
+      CLUSTER: "node-1@node1:6001|http://localhost:3001,node-2@node2:6001|http://localhost:3002,node-3@node3:6001|http://localhost:3003"
+      LOG_LEVEL: info
+    ports: ["3001:3001", "6001:6001"]
+
+  node2:
+    build: .
+    container_name: ledger-node2
+    depends_on:
+      pg2:    { condition: service_healthy }
+      redis2: { condition: service_healthy }
+    environment:
+      NODE_ID: node-2
+      HTTP_PORT: 3001
+      GRPC_PORT: 6001
+      DATABASE_URL: postgres://ledger:ledger@pg2:5432/ledger
+      REDIS_URL: redis://redis2:6379
+      CLUSTER: "node-1@node1:6001|http://localhost:3001,node-2@node2:6001|http://localhost:3002,node-3@node3:6001|http://localhost:3003"
+      LOG_LEVEL: info
+    ports: ["3002:3001", "6002:6001"]
+
+  node3:
+    build: .
+    container_name: ledger-node3
+    depends_on:
+      pg3:    { condition: service_healthy }
+      redis3: { condition: service_healthy }
+    environment:
+      NODE_ID: node-3
+      HTTP_PORT: 3001
+      GRPC_PORT: 6001
+      DATABASE_URL: postgres://ledger:ledger@pg3:5432/ledger
+      REDIS_URL: redis://redis3:6379
+      CLUSTER: "node-1@node1:6001|http://localhost:3001,node-2@node2:6001|http://localhost:3002,node-3@node3:6001|http://localhost:3003"
+      LOG_LEVEL: info
+    ports: ["3003:3001", "6003:6001"]
 
 volumes:
-  pgdata:
+  pg1data:
+  pg2data:
+  pg3data:
