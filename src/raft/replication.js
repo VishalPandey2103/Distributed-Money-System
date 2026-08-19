@@ -9,8 +9,9 @@ import { callUnary } from './rpc.js';
 //   2. Follower handles incoming AppendEntries: validates prev log,
 //      truncates conflicting entries, appends new ones, advances
 //      commit index if leader's commit is ahead.
-//   3. Leader advances its own commitIndex once an entry is
-//      stored on a majority of servers.
+//   3. Leader advances its own commitIndex when a log entry from
+//      the CURRENT term is stored on a majority of servers
+//      (paper §5.4.2 — critical safety rule).
 
 // ---------------- Leader sends AppendEntries ----------------
 
@@ -86,13 +87,16 @@ async function sendAppendEntriesToPeer(node, peer) {
     }
 }
 
-// Advance commitIndex to the highest entry replicated on a majority.
+// Paper §5.4.2: leader advances commitIndex ONLY for entries in its
+// current term (never blindly for entries inherited from a previous
+// term). This closes the Figure 8 corner case.
 async function maybeAdvanceCommitIndex(node) {
     const { index: lastLogIndex } = await node.log_.getLast();
 
     for (let n = lastLogIndex; n > node.commitIndex; n -= 1n) {
         const entry = await node.log_.getAt(n);
         if (!entry) continue;
+        if (entry.term !== node.currentTerm) continue; // §5.4.2
 
         // Count self + peers with matchIndex >= n.
         let replicas = 1;
