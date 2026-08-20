@@ -1,0 +1,12 @@
+# Never ship host-built artifacts into the image. The Dockerfile runs
+# `npm install` on alpine; copying the Windows-built node_modules over
+# that would clobber it with the wrong platform's tree.
+node_modules/
+npm-debug.log
+.env
+.git/
+.gitignore
+coverage/
+*.log
+tests/
+README.md

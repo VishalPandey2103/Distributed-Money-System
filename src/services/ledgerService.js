@@ -103,6 +103,17 @@ export async function transfer({ txnId, fromAccount, toAccount, amountPaise }) {
         if (err.code === 'NOT_LEADER') {
             throw new NotLeaderError(err.leaderId, err.leaderHttp);
         }
+        // The entry may or may not have committed. Both are retryable:
+        // the command is keyed on txnId, so a retry either replays the
+        // cached response or proposes fresh.
+        if (err.code === 'PROPOSE_TIMEOUT') {
+            throw new AppError('PROPOSE_TIMEOUT', 503,
+                'proposal not applied in time; retry with the same txnId');
+        }
+        if (err.message === 'LEADER_STEP_DOWN') {
+            throw new AppError('LEADER_STEP_DOWN', 503,
+                'leader changed mid-proposal; retry with the same txnId');
+        }
         throw err;
     }
 

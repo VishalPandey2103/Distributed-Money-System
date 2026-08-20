@@ -16,6 +16,12 @@ import {
     handleAppendEntries,
 } from './replication.js';
 
+// A proposal that never applies (leader partitioned away mid-flight,
+// state machine wedged on a DB error) must not hang the HTTP request
+// forever. Cap the wait and let the client retry — the entry is
+// idempotent by txnId, so a retry is safe.
+const PROPOSE_TIMEOUT_MS = Number(process.env.RAFT_PROPOSE_TIMEOUT_MS || 5000);
+
 // The raft node. Owns all mutable state and drives the two timers:
 //   - electionTimer: fires when no valid leader traffic within a randomized window
 //   - heartbeatTimer: leader-only, fires every heartbeatMs
@@ -57,6 +63,14 @@ export class RaftNode extends EventEmitter {
         this.applyLoopRunning = false;
         this.applyWaiters = new Map();  // logIndex -> { resolve, reject }
         this.grpcServer = null;
+
+        // Serializes "read the log tail, then append at tail+1". Two
+        // concurrent proposals that both read the same lastLogIndex
+        // would append the same log_index and collide on the primary
+        // key. A promise chain is enough — we are single-threaded, we
+        // only need to keep the read and the write in one critical
+        // section across awaits.
+        this.logLock = Promise.resolve();
     }
 
     async start() {
@@ -101,6 +115,25 @@ export class RaftNode extends EventEmitter {
         }, 50);
     }
 
+    // Runs fn with exclusive access to the log tail.
+    withLogLock(fn) {
+        const run = this.logLock.then(fn, fn);
+        this.logLock = run.then(() => {}, () => {});
+        return run;
+    }
+
+    notLeaderError() {
+        const leader = this.leaderId
+            ? this.peers.find((p) => p.id === this.leaderId) ||
+              (this.leaderId === this.id ? nodeConfig.me : null)
+            : null;
+        const err = new Error('NOT_LEADER');
+        err.code = 'NOT_LEADER';
+        err.leaderId = this.leaderId;
+        err.leaderHttp = leader?.httpBase || null;
+        return err;
+    }
+
     resetElectionTimer() {
         this.lastHeartbeatFromLeaderMs = Date.now();
         this.electionTimeoutMs = randomizedElectionTimeout();
@@ -112,20 +145,25 @@ export class RaftNode extends EventEmitter {
         this.leaderId = this.id;
         this.log.info({ term: this.currentTerm.toString() }, 'became leader');
 
-        const { index: lastLogIndex } = await this.log_.getLast();
+        // Append a no-op in our new term (paper §8) so we can advance
+        // commitIndex quickly and clients see a stable leader. Same
+        // lock as propose() — otherwise a proposal racing this append
+        // picks the same index.
+        const lastLogIndex = await this.withLogLock(async () => {
+            const { index } = await this.log_.getLast();
+            await raftLog.append(pool, {
+                index: index + 1n,
+                term: this.currentTerm,
+                entryType: 'noop',
+                command: null,
+            });
+            return index;
+        });
+
         for (const peer of this.peers) {
             this.nextIndex.set(peer.id, lastLogIndex + 1n);
             this.matchIndex.set(peer.id, 0n);
         }
-
-        // Append a no-op in our new term (paper §8) so we can advance
-        // commitIndex quickly and clients see a stable leader.
-        await raftLog.append(pool, {
-            index: lastLogIndex + 1n,
-            term: this.currentTerm,
-            entryType: 'noop',
-            command: null,
-        });
 
         // Fire heartbeats immediately and on interval.
         if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
@@ -167,32 +205,38 @@ export class RaftNode extends EventEmitter {
     // ---------------- Client proposals (leader only) ----------------
 
     async propose(command) {
-        if (this.state !== 'LEADER') {
-            const leader = this.leaderId
-                ? this.peers.find((p) => p.id === this.leaderId) || (this.leaderId === this.id ? nodeConfig.me : null)
-                : null;
-            const leaderHttp = leader?.httpBase || null;
-            const err = new Error('NOT_LEADER');
-            err.code = 'NOT_LEADER';
-            err.leaderId = this.leaderId;
-            err.leaderHttp = leaderHttp;
-            throw err;
-        }
+        if (this.state !== 'LEADER') throw this.notLeaderError();
 
-        const { index: lastLogIndex } = await raftLog.getLast();
-        const newIndex = lastLogIndex + 1n;
-
-        await raftLog.append(pool, {
-            index: newIndex,
-            term: this.currentTerm,
-            entryType: 'command',
-            command,
+        const newIndex = await this.withLogLock(async () => {
+            // Re-check under the lock: we may have stepped down while
+            // queued behind another proposal.
+            if (this.state !== 'LEADER') throw this.notLeaderError();
+            const { index: lastLogIndex } = await raftLog.getLast();
+            const idx = lastLogIndex + 1n;
+            await raftLog.append(pool, {
+                index: idx,
+                term: this.currentTerm,
+                entryType: 'command',
+                command,
+            });
+            return idx;
         });
 
         // Wait for the state machine to apply this index. If we step
         // down before that happens, the waiter is rejected.
         const applied = await new Promise((resolve, reject) => {
-            this.applyWaiters.set(newIndex, { resolve, reject });
+            const timer = setTimeout(() => {
+                this.applyWaiters.delete(newIndex);
+                const err = new Error('PROPOSE_TIMEOUT');
+                err.code = 'PROPOSE_TIMEOUT';
+                reject(err);
+            }, PROPOSE_TIMEOUT_MS);
+
+            this.applyWaiters.set(newIndex, {
+                resolve: (v) => { clearTimeout(timer); resolve(v); },
+                reject: (e) => { clearTimeout(timer); reject(e); },
+            });
+
             // Kick replication immediately instead of waiting for the
             // next heartbeat tick — cuts p50 latency by half a tick.
             sendAppendEntriesToAllPeers(this).catch(() => {});

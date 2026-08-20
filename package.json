@@ -3,12 +3,17 @@
   "version": "2.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "node --watch src/server.js | pino-pretty",
     "start": "node src/server.js",
     "migrate": "node scripts/migrate.js",
-    "test": "node --test --test-concurrency=1 tests/"
+    "test": "node --test --test-concurrency=1 tests/ledger.test.js tests/cluster.test.js",
+    "test:unit": "node --test tests/ledger.test.js",
+    "test:cluster": "node --test --test-concurrency=1 tests/cluster.test.js",
+    "chaos": "bash tests/chaos/leader-kill.sh"
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.10.9",

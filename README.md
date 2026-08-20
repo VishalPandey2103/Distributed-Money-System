@@ -19,6 +19,15 @@ Distributed replicated ledger. 3 nodes, each with own Postgres + Redis. Consensu
 | node-2 | 3002  | 6002 | 5434     | 6391  |
 | node-3 | 3003  | 6003 | 5435     | 6392  |
 
+## Prerequisites
+
+- Docker (with Compose v2) — runs the whole 3-node stack
+- Node.js >= 20 — only needed to run the test suite from the host
+- `curl` — for the verification snippets below
+
+`jq` is optional; it only pretty-prints the `curl` output in this
+README. Nothing in the project requires it.
+
 ## Run
 
 ```bash
@@ -28,6 +37,11 @@ docker compose logs -f node1     # watch a node
 ```
 
 Migrations run automatically on container startup (see Dockerfile CMD).
+A leader is normally elected within ~2s of `up`; until then every node
+reports `FOLLOWER` and writes return 421.
+
+Tear down with `docker compose down`, or `docker compose down -v` to
+also drop the three Postgres volumes and start from an empty ledger.
 
 ## Verify the cluster
 
@@ -72,19 +86,29 @@ done
 ## Chaos test
 
 ```bash
-./tests/chaos/leader-kill.sh
+npm run chaos       # or: bash tests/chaos/leader-kill.sh
 ```
 
-Kills the current leader, waits for re-election on the surviving majority, issues a transfer against the new leader, verifies the chain, restarts the killed node, and prints the final state on every node.
+Seeds `chaos_A`/`chaos_B` on every node, kills the current leader,
+waits for re-election on the surviving majority, issues a transfer
+against the new leader, verifies the chain, restarts the killed node,
+and checks that the rejoined node converges on the same balance.
+Exits non-zero if re-election, the write, or the chain check fails.
 
-## Cluster integration tests
-
-Requires the stack running.
+## Tests
 
 ```bash
 npm install
-npm test
+npm test            # unit + cluster (needs the stack up)
+npm run test:unit   # money + hash chain only, no stack needed
+npm run test:cluster
 ```
+
+`test:unit` covers the deterministic core — paise parsing and the
+hash chain — and needs no Postgres, Redis, or cluster. The transfer
+path is deliberately not unit-tested: in v2 every write goes through
+`raft.propose()`, which needs a live quorum, so it is covered
+end-to-end by `tests/cluster.test.js` against the running stack.
 
 ## Key design decisions
 
@@ -92,6 +116,8 @@ npm test
 - **Log storage** — persisted in each node's own Postgres so state-machine apply + `last_applied_index` update happen atomically in one transaction. Exactly-once semantics without a two-phase commit.
 - **§5.4.2 safety** — leader only advances commit index for entries in its current term. This closes the Figure 8 corner case where an entry from a previous term appears committed but can be overwritten.
 - **Conflict-index optimization** — followers reply with the first index of the conflicting term, so the leader rewinds `nextIndex` in O(1) jumps instead of O(term length).
+- **Serialized log appends** — `propose()` reads the log tail and appends at tail+1. Those two steps are held under one lock, because concurrent proposals that both read the same tail would append the same `log_index` and collide on the primary key.
+- **Bounded proposals** — a proposal waits `RAFT_PROPOSE_TIMEOUT_MS` (default 5s) to be applied, then returns 503 rather than hanging the request. Retrying with the same `txnId` is safe by construction.
 - **No InstallSnapshot in v2** — snapshots are a v3 concern. Log stays bounded enough for placement scope.
 - **Account creation not raft-replicated in v2** — deliberate simplification. Balances converge only for txnIds proposed through Raft; accounts are created identically on every node ahead of time. A production system would fold `createAccount` into Raft too — trivial extension, kept out here to isolate the interesting work in the transfer path.
 
