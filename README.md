@@ -1,217 +1,257 @@
 # Distributed Money System
 
-A three-replica money ledger that orders transfers with Raft before applying them to independent local databases. A client may contact any HTTP node, but only the elected leader accepts a new transfer command. A replica that has already applied a transaction may return its cached outcome. Once a quorum has stored a command, every replica eventually applies the same deterministic state-machine transition and arrives at the same balances and ledger hash chain.
+This project is a small three-node money ledger built around a Raft cluster, local Postgres databases, and Redis for idempotency caching. The code is intentionally narrow and easy to trace: the HTTP layer decides whether a request is valid, the Raft layer decides ordering, and the state machine applies the final transfer result locally on each node.
 
-The project is deliberately small enough to study end to end: Express exposes the HTTP API, gRPC carries Raft traffic, PostgreSQL holds both the Raft and ledger state, and Redis accelerates idempotent retries without becoming the source of truth.
-
-## What the system guarantees
-
-- Transfers are ordered by a Raft leader and committed only after a quorum acknowledges the log entry.
-- A transfer request is keyed by `txnId`; repeating the same key returns the recorded outcome instead of moving money twice.
-- Each replica applies committed commands in log order. Balance changes, the append-only ledger entry, the idempotency record, and the applied-log marker are committed in one database transaction.
-- Ledger records are hash chained. `GET /api/verify` recomputes the chain and detects a broken predecessor link or entry hash.
-- Amounts are handled as integer paise with `BigInt`, never floating-point values.
-
-These guarantees apply to transfers. Creating an account is a local operation and must be performed on every replica before that account can participate in a replicated transfer. See [Important operating limits](#important-operating-limits).
+The important part is that there is no shared database behind the replicas. Each node has its own Postgres and Redis, and every replica applies the same committed log entries to its own state.
 
 ## Architecture
 
-```mermaid
-flowchart TB
-    C[Client]
-
-    subgraph CLUSTER[Three-node cluster]
-        direction LR
-
-        subgraph N1[Node 1]
-            H1[Express HTTP API]
-            R1[Raft node]
-            S1[Deterministic state machine]
-            P1[(PostgreSQL)]
-            D1[(Redis)]
-            H1 --> R1 --> S1 --> P1
-            H1 --> D1
-        end
-
-        subgraph N2[Node 2]
-            H2[Express HTTP API]
-            R2[Raft node]
-            S2[Deterministic state machine]
-            P2[(PostgreSQL)]
-            D2[(Redis)]
-            H2 --> R2 --> S2 --> P2
-            H2 --> D2
-        end
-
-        subgraph N3[Node 3]
-            H3[Express HTTP API]
-            R3[Raft node]
-            S3[Deterministic state machine]
-            P3[(PostgreSQL)]
-            D3[(Redis)]
-            H3 --> R3 --> S3 --> P3
-            H3 --> D3
-        end
-    end
-
-    C -->|HTTP: read, create account, transfer| H1
-    C -->|HTTP: read, create account, transfer| H2
-    C -->|HTTP: read, create account, transfer| H3
-
-    R1 <-->|gRPC: RequestVote and AppendEntries| R2
-    R2 <-->|gRPC: RequestVote and AppendEntries| R3
-    R1 <-->|gRPC: RequestVote and AppendEntries| R3
-```
-
-Each application node owns its own PostgreSQL and Redis instance. There is no shared database behind the replicas: a shared database would bypass the replicated-state-machine model. The Docker Compose configuration gives each application node a distinct database and cache connection.
-
-### Local and published addresses
-
-| Replica | Published HTTP | Published gRPC | PostgreSQL | Redis |
-| --- | ---: | ---: | ---: | ---: |
-| `node-1` | `3001` | `6001` | `5433` | `6390` |
-| `node-2` | `3002` | `6002` | `5434` | `6391` |
-| `node-3` | `3003` | `6003` | `5435` | `6392` |
-
-Inside the Compose network, every application container listens on the same HTTP and gRPC addresses. Docker publishes different host ports for the second and third replicas. Cluster membership comes from `CLUSTER`, whose entries have this form:
+This is a three-node Raft cluster running as separate Docker services. Each node exposes the same HTTP API, but only the current leader accepts new transfer proposals.
 
 ```text
-node-id@grpc-host:grpc-port|http-base-address
+                          ┌──────────────────────────────┐
+                          │        Client / API user     │
+                          │  POST /api/accounts          │
+                          │  POST /api/transfer          │
+                          │  GET /api/raft/status       │
+                          └──────────────┬───────────────┘
+                                         │
+                                         │ HTTP
+                                         ▼
+
+              ┌────────────────────────────────────────────────────────────┐
+              │                        node-1                               │
+              │  Express API  ──►  Raft node  ──►  Postgres (pg1)         │
+              │                     │      │                                │
+              │                     │      └─► raft_meta / raft_log       │
+              │                     │                                        │
+              │                     └────► Redis (redis1)                   │
+              │                          idem:<txnId> fast path             │
+              └────────────────────────────────────────────────────────────┘
+                                         │
+                                         │ gRPC / Raft replication
+                                         │
+              ┌────────────────────────────────────────────────────────────┐
+              │                        node-2                               │
+              │  Express API  ──►  Raft node  ──►  Postgres (pg2)         │
+              │                     │      │                                │
+              │                     │      └─► raft_meta / raft_log       │
+              │                     │                                        │
+              │                     └────► Redis (redis2)                   │
+              └────────────────────────────────────────────────────────────┘
+                                         │
+                                         │
+              ┌────────────────────────────────────────────────────────────┐
+              │                        node-3                               │
+              │  Express API  ──►  Raft node  ──►  Postgres (pg3)         │
+              │                     │      │                                │
+              │                     │      └─► raft_meta / raft_log       │
+              │                     │                                        │
+              │                     └────► Redis (redis3)                   │
+              └────────────────────────────────────────────────────────────┘
+
+                 node-1 <-------------------- Raft peer traffic --------------------> node-2
+                          \____________________  RequestVote / AppendEntries  ______________/
+
+                 node-2 <-------------------- Raft peer traffic --------------------> node-3
+                          \____________________  RequestVote / AppendEntries  ______________/
+
+                 node-1 <-------------------- Raft peer traffic --------------------> node-3
+                          \____________________  RequestVote / AppendEntries  ______________/
 ```
 
-The gRPC address is used for Raft RPCs. The HTTP address is returned to clients when they contact a follower and need to retry against the leader.
+This is the runtime layout the repo actually builds in Docker. Each node owns its own database and cache; the cluster as a whole is defined by the `CLUSTER` environment in [docker-compose.yml](docker-compose.yml).
 
-### Main components
+## What is in this repo
 
-| Area | Responsibility | Primary code |
-| --- | --- | --- |
-| HTTP server | Parses JSON, mounts routes, starts Raft, and handles shutdown. | `src/server.js` |
-| HTTP API | Validates requests and exposes accounts, transfers, verification, and status. | `src/routes/`, `src/controllers/` |
-| Raft node | Holds volatile consensus state, runs timers, owns proposal waiters, and applies committed entries. | `src/raft/raftNode.js` |
-| Election | Starts elections after missing leader traffic and handles votes. | `src/raft/election.js` |
-| Replication | Sends and processes `AppendEntries`, reconciles logs, and advances the commit index. | `src/raft/replication.js` |
-| RPC transport | Loads the protobuf contract and creates gRPC clients and server handlers. | `src/raft/rpc.js`, `src/proto/raft.proto` |
-| State machine | Applies a committed transfer exactly once inside a local database transaction. | `src/services/stateMachine.js` |
-| Ledger service | Implements local account access, transfer request handling, idempotency lookup, and chain verification. | `src/services/ledgerService.js` |
-| Persistence | Stores accounts, ledger records, idempotency records, Raft metadata, and Raft log entries. | `src/models/`, `migrations/` |
+- `src/server.js` starts the Express app and brings up the local Raft node.
+- `src/routes/*` exposes the HTTP API.
+- `src/controllers/*` validates request payloads and translates domain errors into responses.
+- `src/raft/*` contains the election, log replication, and RPC code.
+- `src/services/stateMachine.js` is the deterministic apply step that updates balances and ledger entries.
+- `src/services/ledgerService.js` handles idempotency and leader checks.
+- `src/models/*` and `migrations/*` store raft state, accounts, ledger rows, and idempotency results.
+- `tests/cluster.test.js` exercises the running docker-compose cluster.
 
-## Transfer lifecycle
+## How the cluster is laid out
 
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Node as Contacted HTTP node
-    participant Cache as Local Redis
-    participant Follower as Raft follower
-    participant DB as Leader PostgreSQL
+There are three nodes:
 
-    Client->>Node: POST /api/transfer with txnId
-    Node->>Cache: Look up idem:txnId
-    alt cached outcome exists
-        Cache-->>Node: Recorded outcome
-        Node-->>Client: Return cached outcome
-    else cache miss
-        Node->>Node: Check local PostgreSQL idempotency record
-        alt contacted node is a follower
-            Node-->>Client: 421 with leader HTTP address
-        else contacted node is the leader
-            Node->>Node: Append transfer command to local Raft log
-            Node->>Follower: AppendEntries over gRPC
-            Follower-->>Node: Persisted acknowledgement
-            Node->>Node: Quorum stored current-term entry
-            Node->>DB: Apply command in one transaction
-            DB-->>Node: Ledger result and applied index
-            Node-->>Client: Transfer outcome
-            Node->>Follower: Later AppendEntries carries commit index
-            Follower->>Follower: Apply the same command locally
-        end
-    end
+- node-1: http://localhost:3001, gRPC 6001, Postgres 5433, Redis 6390
+- node-2: http://localhost:3002, gRPC 6002, Postgres 5434, Redis 6391
+- node-3: http://localhost:3003, gRPC 6003, Postgres 5435, Redis 6392
+
+Each node runs:
+
+- a local HTTP API
+- a local Raft member
+- its own Postgres database
+- its own Redis instance
+
+The cluster membership is defined in `docker-compose.yml` through `CLUSTER`.
+
+## Real behavior of the system
+
+This is not a generic "banking demo" with hidden magic. The code makes some things explicit:
+
+- Transfers are not accepted by every node. Only the active leader should accept a new transfer proposal.
+- If a follower receives a transfer request, it responds with HTTP 421 and includes the leader HTTP address.
+- The client is expected to retry against the leader using the same `txnId`.
+- A transfer is idempotent by `txnId`. The same transaction ID resolves to the same stored outcome.
+- Amounts are stored as integer paise using `BigInt`; decimal values are rejected.
+- Account creation is not Raft-replicated. It is intentionally local and must be done on each node before transfers can use those account IDs.
+- The state machine records both successful and failed transfers in the local idempotency table so the result is replay-safe.
+
+## Transfer flow, in plain terms
+
+1. Client sends `POST /api/transfer` to any node.
+2. The service checks Redis for `idem:<txnId>`.
+3. If Redis is empty, it checks the local Postgres `idempotency` table.
+4. If the contacted node is not leader, it returns 421 with `leaderHttp` and the client retries there.
+5. The leader appends the transfer to the Raft log and replicates it to peers.
+6. Once a quorum stores the entry, the leader applies it to its local state machine.
+7. The state machine locks the two accounts in deterministic order, updates balances, writes the ledger hash-chained record, stores the idempotency result, and advances the applied index in one transaction.
+8. Followers eventually learn the commit index and apply the same command in order.
+
+This is a replicated state machine, not a centrally shared ledger.
+
+## API surface
+
+### Health
+
+`GET /health`
+
+Returns whether the node is up and which node ID it is.
+
+Example:
+
+```bash
+curl http://localhost:3001/health
 ```
 
-The actual request path is as follows:
+### Account creation
 
-1. The controller validates `txnId`, account IDs, and `amountPaise`. Positive transfer amounts are required.
-2. `ledgerService.transfer()` checks the local Redis key `idem:<txnId>`. A cache hit is safe because only an already-applied outcome is stored there.
-3. On a cache miss, it checks local PostgreSQL's `idempotency` table. This table is authoritative when Redis is cold or unavailable.
-4. A follower rejects the proposal with HTTP `421` and provides `leaderId` and `leaderHttp` in the response body. It also sets `X-Leader-Address` when known. The client must retry there; the service does not issue an automatic redirect.
-5. The leader serializes the read-tail-and-append operation, writes the command to `raft_log`, and immediately sends `AppendEntries` to both peers.
-6. Once a majority has the entry, the leader advances its commit index only when the entry belongs to the leader's current term.
-7. The leader's apply loop calls the state machine. The state machine locks the two account rows in sorted order, records either the successful result or a business rejection, and advances `last_applied_index` in the same transaction.
-8. Followers learn the new commit index through subsequent `AppendEntries` traffic, then execute the same state-machine command in log order.
-9. The leader caches the applied response in Redis and returns it. A retry with the same `txnId` receives that same recorded result.
+`POST /api/accounts`
 
-An insufficient balance, an unknown account, or the same source and destination account is also recorded as an idempotent state-machine outcome. That matters: all replicas reach the same result for a committed command, including a rejected one.
+Body:
 
-## How consensus works here
+```json
+{
+  "accountId": "alice",
+  "openingBalancePaise": "100000"
+}
+```
 
-### Election
+The account ID must match the regex used in the validator: alphanumeric, underscore, or hyphen.
 
-Every node starts as a follower and tracks the time of the most recent valid leader heartbeat. If that time exceeds a randomized election timeout, the node:
+Example:
 
-1. Persists a new term and its self-vote before making any RPC.
-2. Becomes a candidate and sends `RequestVote` calls to all peers in parallel.
-3. Becomes leader after receiving a quorum of votes.
-4. Appends a no-op entry, initializes follower replication positions, and starts periodic `AppendEntries` heartbeats.
+```bash
+curl -sS -X POST http://localhost:3001/api/accounts \
+  -H 'content-type: application/json' \
+  -d '{"accountId":"alice","openingBalancePaise":"100000"}'
+```
 
-A node steps down if it learns of a higher term. If a leader steps down while client proposals are waiting, those requests fail so the client can safely retry with the same `txnId`.
+### Get account
 
-### Replication and commit
+`GET /api/accounts/:accountId`
 
-For each follower, a leader tracks `nextIndex` and `matchIndex`. `AppendEntries` includes the preceding log index and term, so a follower can reject a request when its log does not match the leader's prefix. The rejection supplies a conflict index; the leader uses that hint to rewind efficiently instead of backing up one entry at a time.
+Example:
 
-Before appending new entries, a follower performs any required conflict truncation and append inside one PostgreSQL transaction. A command becomes committed after a quorum has stored it. The leader only advances `commitIndex` for entries from its current term, which prevents an older inherited entry from being treated as committed too early.
+```bash
+curl http://localhost:3001/api/accounts/alice
+```
 
-### Persistent state
+### Transfer
 
-Each replica stores this consensus state in its own database:
+`POST /api/transfer`
 
-- `raft_meta`: current term, vote target, and the final applied log index.
-- `raft_log`: ordered command and no-op entries.
+Body:
 
-The database is configured to synchronously commit writes. On restart, a node restores this metadata, sets its volatile commit index to its recorded applied index, starts gRPC, and re-enters the election process.
+```json
+{
+  "txnId": "txn-001",
+  "from": "alice",
+  "to": "bob",
+  "amountPaise": "25000"
+}
+```
 
-## Data model and integrity
+Important details from the code:
 
-### Accounts
+- `txnId` is required and limited to `[A-Za-z0-9_-]+`
+- `amountPaise` must be positive
+- same-account transfer is rejected
+- if the account is missing or balance is too low, the outcome is recorded as a committed rejection
 
-`accounts` holds the current balance for each account. `openingBalancePaise` and transfer amounts are integer paise values. The input boundary accepts an integer string or a safe integer, then converts it to `BigInt`; decimal amounts and unsafe numeric values are rejected.
+Example:
 
-During an applied transfer, the state machine selects both accounts with `FOR UPDATE` in lexical ID order. Taking locks in one deterministic order avoids a deadlock when concurrent transfers involve the same accounts in opposite directions.
+```bash
+curl -sS -X POST http://localhost:3001/api/transfer \
+  -H 'content-type: application/json' \
+  -d '{"txnId":"txn-001","from":"alice","to":"bob","amountPaise":"25000"}'
+```
 
-### Ledger and hash chain
+If you hit a follower, you will get a response like:
 
-`ledger` is append-only at the database layer: update and delete rules discard those operations. Each record stores:
+```json
+{
+  "error": {
+    "code": "NOT_LEADER",
+    "message": "NOT_LEADER",
+    "leaderId": "node-2",
+    "leaderHttp": "http://localhost:3002"
+  }
+}
+```
 
-- the transaction ID, source account, destination account, and amount;
-- the previous entry hash; and
-- a SHA-256 hash of `previous hash | transaction ID | source | destination | amount`.
+The client is expected to retry the same request against `leaderHttp`.
 
-The first record uses a fixed all-zero predecessor hash. `GET /api/verify` loads ledger records in order and checks both the predecessor link and the recomputed hash.
+### Verify ledger
 
-### Exactly-once application
+`GET /api/verify`
 
-The `idempotency` table maps a transaction ID to the HTTP outcome body. In a single local transaction, the state machine can write the ledger record, update both account balances, insert the idempotency record, and move `last_applied_index` forward. If a process stops after that transaction commits, replay begins after the recorded index and does not apply the command a second time.
+This loads the ledger in order and checks the hash chain. It is the direct integrity check for the append-only ledger.
 
-Redis is only a time-limited fast path for this data. A missing cache entry cannot create a duplicate transfer because PostgreSQL and the state machine remain authoritative.
+Example:
 
-## Run the cluster
+```bash
+curl http://localhost:3001/api/verify
+```
+
+### Raft status
+
+`GET /api/raft/status`
+
+This is the status endpoint used by the tests and by operators to find the leader.
+
+Example:
+
+```bash
+curl http://localhost:3001/api/raft/status
+```
+
+## Running the cluster
 
 ### Prerequisites
 
 - Docker with the Compose plugin
-- Node.js and npm for host-side tests
-- `curl` for the examples
-- A Bash-compatible shell for the chaos script
+- Node.js 20+
+- npm
 
-### Start
+### Start everything
 
 ```bash
 docker compose up --build -d
-docker compose ps
-docker compose logs -f node1
 ```
 
-Each application container runs database migrations before starting its HTTP server. Wait until one status endpoint reports `"state":"LEADER"` before sending transfers.
+Check node status:
+
+```bash
+docker compose ps
+```
+
+The code expects a leader to appear before transfers are sent:
 
 ```bash
 curl -s http://localhost:3001/api/raft/status
@@ -219,35 +259,53 @@ curl -s http://localhost:3002/api/raft/status
 curl -s http://localhost:3003/api/raft/status
 ```
 
-Stop the stack while retaining its data:
+Stop the stack without deleting data:
 
 ```bash
 docker compose down
 ```
 
-To remove the named PostgreSQL volumes and start with an empty ledger, run the following destructive command:
+Remove the named Postgres volumes and reset the ledger state completely:
 
 ```bash
 docker compose down -v
 ```
 
-## Use the HTTP API
+## Things to keep in mind
 
-All amounts below are paise. For example, `25000` represents 250.00 rupees.
+- Account creation has to be repeated on every node. That is intentional in this version.
+- The cluster members do not share a database; they reconcile through Raft.
+- Redis is a cache and a fast path; Postgres is the real source of truth for idempotency and state history.
+- The hash-chain check is the easiest verification route when you want to confirm the ledger has not been tampered with.
 
-### Create accounts on every replica
+## Tests
 
-Account creation is not a Raft command. Seed the same accounts on all three HTTP nodes before making a transfer.
+This repo has two test groups:
+
+- unit tests for money parsing and ledger hash verification: `npm run test:unit`
+- end-to-end cluster tests: `npm run test:cluster`
+- both together: `npm test`
+
+The cluster tests assume the docker-compose stack is already running.
+
+Example:
 
 ```bash
-for port in 3001 3002 3003; do
-  curl -sS -X POST "http://localhost:${port}/api/accounts" \
-    -H 'content-type: application/json' \
-    -d '{"accountId":"alice","openingBalancePaise":"100000"}'
-  curl -sS -X POST "http://localhost:${port}/api/accounts" \
-    -H 'content-type: application/json' \
-    -d '{"accountId":"bob","openingBalancePaise":"0"}'
-done
+npm run test:unit
+npm run test:cluster
+```
+
+## Notes from the implementation
+
+The project is intentionally small and explicit about where the important invariants live:
+
+- `src/raft/raftNode.js` owns the consensus state and apply loop
+- `src/services/stateMachine.js` is the exact-once state transition
+- `src/services/ledgerService.js` is where the HTTP layer and Raft layer meet
+- `src/models/*` and `migrations/*` are where the durable state sits
+
+If you want to understand the behavior, start there rather than reading the README alone.
+
 ```
 
 On a freshly initialized cluster, `alice` starts with 1000.00 rupees and `bob` with zero.
